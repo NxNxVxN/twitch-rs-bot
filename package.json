@@ -1,0 +1,19 @@
+{
+  "name": "finals-rs-api",
+  "version": "1.0.0",
+  "description": "Hosted API wrapping The Finals ranked leaderboard for use in StreamElements/Streamlabs custom commands.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "node-fetch": "^2.7.0"
+  }
+}
