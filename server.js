@@ -9,6 +9,12 @@ const PLATFORM = 'crossplay';
 const API_BASE = 'https://api.the-finals-leaderboard.com/v1/leaderboard';
 const SEASON_RECHECK_MS = 6 * 60 * 60 * 1000; // 6 hours
 const KNOWN_BASELINE_SEASON = 7;
+const FETCH_TIMEOUT_MS = 8000;
+
+// Optional manual override - if set, skips auto-detection entirely and
+// always uses this season id. Use this if auto-detection ever picks the
+// wrong season; set SEASON_OVERRIDE in the hosting platform's env vars.
+const SEASON_OVERRIDE = process.env.SEASON_OVERRIDE || '';
 
 // The streamer's own Embark ID, used when ?name= is empty.
 // Set this in the hosting platform's environment variables.
@@ -17,20 +23,75 @@ const STREAMER_EMBARK_ID = process.env.STREAMER_EMBARK_ID || '';
 let currentSeason = null;
 let seasonDetectedAt = 0;
 
+// fetch with a hard timeout so a slow/stuck request can't hang the bot
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        // Ask for uncompressed responses - works around a node-fetch v2
+        // bug (ERR_STREAM_PREMATURE_CLOSE) where gzip decompression
+        // occasionally drops the connection mid-stream on some hosts.
+        'Accept-Encoding': 'identity',
+        ...options.headers,
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Retries a fetch-and-parse operation a couple times if it hits a
+// transient network/stream error, since those are usually one-off blips.
+async function withRetry(fn, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const transient =
+        err.code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+        err.type === 'aborted' ||
+        err.name === 'AbortError' ||
+        /premature close/i.test(err.message || '');
+      if (!transient || i === attempts - 1) throw err;
+      console.log(`Transient fetch error (attempt ${i + 1}/${attempts}): ${err.message}. Retrying...`);
+      await new Promise(r => setTimeout(r, 300 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 // ---------- SEASON AUTO-DETECTION ----------
 async function seasonExists(seasonId) {
   try {
     const url = `${API_BASE}/${seasonId}/${PLATFORM}?count=true`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
-    if (!res.ok) return false;
-    const data = await res.json();
-    return typeof data.count === 'number' && data.count > 0;
-  } catch {
+    const data = await withRetry(async () => {
+      const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }, 2);
+    const exists = typeof data.count === 'number' && data.count > 0;
+    console.log(`seasonExists(${seasonId}): count=${data.count}, exists=${exists}`);
+    return exists;
+  } catch (err) {
+    console.log(`seasonExists(${seasonId}): error - ${err.message}`);
     return false;
   }
 }
 
 async function detectCurrentSeason() {
+  if (SEASON_OVERRIDE) {
+    currentSeason = SEASON_OVERRIDE;
+    seasonDetectedAt = Date.now();
+    console.log(`Using manual SEASON_OVERRIDE: ${currentSeason}`);
+    return currentSeason;
+  }
+
   let best = `s${KNOWN_BASELINE_SEASON}`;
   let n = KNOWN_BASELINE_SEASON;
   while (await seasonExists(`s${n + 1}`)) {
@@ -57,9 +118,17 @@ detectCurrentSeason().catch(err => console.error('Initial season detection faile
 async function searchLeaderboard(query) {
   const season = await getCurrentSeason();
   const url = `${API_BASE}/${season}/${PLATFORM}?name=${encodeURIComponent(query)}`;
-  const res = await fetch(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
-  if (!res.ok) throw new Error(`API responded with ${res.status}`);
-  const data = await res.json();
+  console.log(`Fetching: ${url}`);
+
+  const data = await withRetry(async () => {
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`API responded with ${res.status} for season ${season}: ${body.slice(0, 200)}`);
+    }
+    return res.json();
+  });
+
   return data && data.data ? data.data : [];
 }
 
@@ -76,7 +145,7 @@ async function lookupPlayer(query) {
 }
 
 function formatStatsMessage(entry) {
-  const name = entry.name ?? 'Unknown';
+  const name = entry.name ?? 'unknown';
   const rank = entry.rank ?? '?';
   const league = entry.league ?? '';
   const score = entry.rankScore ?? entry.fame ?? entry.score ?? '?';
@@ -84,11 +153,12 @@ function formatStatsMessage(entry) {
 
   let trend = '';
   if (typeof change === 'number') {
-    if (change > 0) trend = ` (+${change})`;
-    else if (change < 0) trend = ` (${change})`;
+    if (change > 0) trend = ` up ${change}`;
+    else if (change < 0) trend = ` down ${Math.abs(change)}`;
   }
 
-  return `${name} is rank #${rank}${league ? ` [${league}]` : ''} with ${score} RS${trend}.`;
+  const parts = [`${name} rank ${rank}`, league, `${score} rs${trend}`].filter(Boolean);
+  return parts.join(' ').toLowerCase();
 }
 
 // ---------- ROUTE ----------
@@ -103,7 +173,7 @@ app.get('/rs', async (req, res) => {
 
   if (!query) {
     if (!STREAMER_EMBARK_ID) {
-      return res.send('No default streamer ID is configured for this bot.');
+      return res.send('no default streamer id configured');
     }
     query = STREAMER_EMBARK_ID;
     lookingUpSelf = true;
@@ -113,29 +183,33 @@ app.get('/rs', async (req, res) => {
     const result = await lookupPlayer(query);
 
     if (result.type === 'none') {
-      const who = lookingUpSelf ? `the streamer's ID (${query})` : `"${query}"`;
+      const who = lookingUpSelf ? `streamer id ${query}` : `"${query}"`;
       return res.send(
-        `Couldn't find ${who} on the ranked leaderboard. ${
-          lookingUpSelf
-            ? 'Check the STREAMER_EMBARK_ID setting.'
-            : 'Check the spelling, or they may be unranked / outside the top 10,000.'
-        }`
+        `couldn't find ${who} on the ranked leaderboard${lookingUpSelf ? '' : ', check spelling or they may be unranked'}`
       );
     }
 
     if (result.type === 'multiple') {
-      const names = result.matches.slice(0, 5).map(e => e.name).join(', ');
-      const more = result.matches.length > 5 ? ` (+${result.matches.length - 5} more)` : '';
-      return res.send(
-        `Multiple players match "${query}": ${names}${more}. Try again with the full tag, e.g. !rs ${result.matches[0].name}`
-      );
+      const names = result.matches.slice(0, 5).map(e => e.name.toLowerCase()).join(', ');
+      return res.send(`multiple matches for "${query}": ${names} - try the full tag`);
     }
 
     return res.send(formatStatsMessage(result.entry));
   } catch (err) {
-    console.error('Lookup error:', err);
-    return res.send('Something went wrong fetching ranked stats. Try again in a bit.');
+    console.error('Lookup error:', err.message);
+    return res.send('something went wrong fetching ranked stats, try again in a bit');
   }
+});
+
+// Debug route - shows current detected season and config status without
+// exposing secrets. Useful for sanity-checking the live deployment.
+app.get('/debug', (req, res) => {
+  res.json({
+    currentSeason,
+    seasonDetectedAt: seasonDetectedAt ? new Date(seasonDetectedAt).toISOString() : null,
+    seasonOverrideSet: Boolean(SEASON_OVERRIDE),
+    streamerIdSet: Boolean(STREAMER_EMBARK_ID),
+  });
 });
 
 // Simple health check for the hosting platform / uptime pings.
