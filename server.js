@@ -163,13 +163,55 @@ function formatStatsMessage(entry) {
 
 // ---------- ROUTE ----------
 // GET /rs?name=Nats#1234   (or ?name= empty/missing -> streamer's own ID)
+//
+// Two StreamElements command formats are supported, in case one fails to
+// parse on a given account:
+//
+//   Primary (single-layer $() variable, no nesting):
+//     $(urlfetch https://twitch-rs-bot.onrender.com/rs?name=$(query))
+//     chat usage: !rs Balise#2431  or  !rs Balise
+//
+//   Fallback (if a literal "#" never survives StreamElements encoding -
+//   it gets URL-encoded as "+" between words instead, no "#" needed):
+//     same command, chat usage: !rs Balise 2431  (space instead of #)
+//     this route reconstructs "Balise#2431" automatically when the last
+//     word is purely numeric and no "#" is already present.
+//
+// This route still defensively re-decodes whatever arrives, in case of
+// partial encoding or an unescaped "#" making it through some other way.
 // Always responds with 200 + plain text, since StreamElements posts
 // whatever text comes back verbatim into chat - no JSON, no error pages.
 app.get('/rs', async (req, res) => {
   res.set('Content-Type', 'text/plain; charset=utf-8');
 
-  let query = (req.query.name || '').trim();
+  // Express splits the URL on "?" before we ever see req.query, so an
+  // unescaped "#" in the name (e.g. "Balise#2431") is the main thing to
+  // recover here - browsers/StreamElements may send it raw, or the route
+  // may receive it already as part of req.query.name depending on how
+  // urlfetch encoded the request. Handle both shapes defensively.
+  let rawName = req.query.name;
+  if (rawName === undefined) {
+    // Fallback: pull everything after "name=" directly from the raw URL,
+    // in case an unescaped "#" truncated query parsing.
+    const match = req.originalUrl.match(/name=([^&]*)/);
+    rawName = match ? match[1] : '';
+  }
+
+  let query = decodeURIComponent((rawName || '').replace(/\+/g, ' ')).trim();
   let lookingUpSelf = false;
+
+  // Fallback for the case where a literal "#" never survives StreamElements'
+  // variable encoding: if someone types "!rs Balise 2431" (name and tag
+  // separated by a space instead of "#"), and the last word is purely
+  // numeric, treat it as the tag and rebuild "Balise#2431" ourselves.
+  // A real Embark ID never has a space, so this is safe - it only
+  // triggers on the deliberate space-separated fallback format.
+  const spaceTagMatch = query.match(/^(.+)\s+(\d{1,5})$/);
+  if (spaceTagMatch && !query.includes('#')) {
+    query = `${spaceTagMatch[1]}#${spaceTagMatch[2]}`;
+  }
+
+  console.log(`/rs called - raw query string: "${req.originalUrl}", resolved name: "${query}"`);
 
   if (!query) {
     if (!STREAMER_EMBARK_ID) {
@@ -203,8 +245,13 @@ app.get('/rs', async (req, res) => {
 
 // Debug route - shows current detected season and config status without
 // exposing secrets. Useful for sanity-checking the live deployment.
+// VERSION marker: bump this string any time server.js changes, so a quick
+// /debug check confirms whether Render is actually running the latest code.
+const SERVER_VERSION = 'v5-space-tag-fallback';
+
 app.get('/debug', (req, res) => {
   res.json({
+    version: SERVER_VERSION,
     currentSeason,
     seasonDetectedAt: seasonDetectedAt ? new Date(seasonDetectedAt).toISOString() : null,
     seasonOverrideSet: Boolean(SEASON_OVERRIDE),
