@@ -133,10 +133,24 @@ async function searchLeaderboard(query) {
 }
 
 async function lookupPlayer(query) {
-  const entries = await searchLeaderboard(query);
+  const allEntries = await searchLeaderboard(query);
+  if (allEntries.length === 0) return { type: 'none' };
+
+  // The leaderboard API matches against steamName/psnName/xboxName too, not
+  // just the in-game Embark name - that surfaces unrelated players whose
+  // platform alias happens to contain the search term (e.g. searching
+  // "ekazo" can match someone named "EkaZo Bot" on Steam who has a totally
+  // different Embark ID). We only want results whose actual in-game name
+  // (the part before "#") contains the search term.
+  const queryLower = query.toLowerCase();
+  const entries = allEntries.filter(e => {
+    const inGameName = (e.name || '').split('#')[0].toLowerCase();
+    return inGameName.includes(queryLower.split('#')[0]);
+  });
+
   if (entries.length === 0) return { type: 'none' };
 
-  const exact = entries.find(e => e.name && e.name.toLowerCase() === query.toLowerCase());
+  const exact = entries.find(e => e.name && e.name.toLowerCase() === queryLower);
   if (exact) return { type: 'single', entry: exact };
 
   if (entries.length === 1) return { type: 'single', entry: entries[0] };
@@ -258,7 +272,7 @@ app.get('/rs', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v6-copyable-suggestions';
+const SERVER_VERSION = 'v8-ingame-name-only';
 
 app.get('/debug', (req, res) => {
   res.json({
