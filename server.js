@@ -232,8 +232,19 @@ app.get('/rs', async (req, res) => {
     }
 
     if (result.type === 'multiple') {
-      const names = result.matches.slice(0, 5).map(e => e.name.toLowerCase()).join(', ');
-      return res.send(`multiple matches for "${query}": ${names} - try the full tag`);
+      // Suggest the space-separated format ("!rs name tag"), not "name#tag" -
+      // a literal "#" gets stripped by URL-fragment behavior before this
+      // server ever sees it, so suggesting it would just send people back
+      // into the same dead end. The space format is what actually works,
+      // and these are ready to copy-paste straight back into chat.
+      const suggestions = result.matches
+        .slice(0, 3)
+        .map(e => {
+          const [namePart, tagPart] = e.name.split('#');
+          return tagPart ? `!rs ${namePart.toLowerCase()} ${tagPart}` : `!rs ${e.name.toLowerCase()}`;
+        })
+        .join(' or ');
+      return res.send(`multiple matches for "${query}" - try: ${suggestions}`);
     }
 
     return res.send(formatStatsMessage(result.entry));
@@ -247,7 +258,7 @@ app.get('/rs', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v5-space-tag-fallback';
+const SERVER_VERSION = 'v6-copyable-suggestions';
 
 app.get('/debug', (req, res) => {
   res.json({
