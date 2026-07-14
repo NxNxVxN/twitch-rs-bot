@@ -127,6 +127,7 @@ const NAME_OVERRIDES = {
       "checked the leaderboard twice, still no stormmehul - some legends are unranked by choice (and skill).",
       "stormmehul is rank #never [Iron -1] with -9999 RS (still queuing).",
       "stormmehul isn't on the leaderboard because the servers have mercy.",
+      "stormmehul is rank ass 1.",
     ];
     return roasts[Math.floor(Math.random() * roasts.length)];
   },
