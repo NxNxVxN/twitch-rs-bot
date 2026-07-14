@@ -114,6 +114,24 @@ async function getCurrentSeason() {
 
 detectCurrentSeason().catch(err => console.error('Initial season detection failed:', err));
 
+// ---------- SPECIAL-CASE RESPONSES ----------
+// Some names get a canned, funny reply instead of a real leaderboard
+// lookup - keyed by in-game name only (the part before "#"), lowercase.
+// Add more entries here the same way if other regulars want the same
+// treatment.
+const NAME_OVERRIDES = {
+  stormmehul: () => {
+    const roasts = [
+      "stormmehul has no rank because Diamond doesn't exist in Bronze lobbies.",
+      "stormmehul's last ranked win was a rumor, never confirmed.",
+      "checked the leaderboard twice, still no stormmehul - some legends are unranked by choice (and skill).",
+      "stormmehul is rank #never [Iron -1] with -9999 RS (still queuing).",
+      "stormmehul isn't on the leaderboard because the servers have mercy.",
+    ];
+    return roasts[Math.floor(Math.random() * roasts.length)];
+  },
+};
+
 // ---------- LOOKUP LOGIC ----------
 async function searchLeaderboard(query) {
   const season = await getCurrentSeason();
@@ -235,6 +253,15 @@ app.get('/rs', async (req, res) => {
     lookingUpSelf = true;
   }
 
+  // Special-case names (e.g. stormmehul) get a canned funny reply instead
+  // of a real leaderboard lookup. Matches on the in-game name only (before
+  // "#"), case-insensitive, so "stormmehul", "StormMehul#1234", and the
+  // space-separated fallback format all trigger it.
+  const nameOnly = query.split('#')[0].toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(NAME_OVERRIDES, nameOnly)) {
+    return res.send(NAME_OVERRIDES[nameOnly]());
+  }
+
   try {
     const result = await lookupPlayer(query);
 
@@ -272,7 +299,7 @@ app.get('/rs', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v8-ingame-name-only';
+const SERVER_VERSION = 'v9-stormmehul-easter-egg';
 
 app.get('/debug', (req, res) => {
   res.json({
