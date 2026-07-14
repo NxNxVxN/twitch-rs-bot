@@ -119,18 +119,46 @@ detectCurrentSeason().catch(err => console.error('Initial season detection faile
 // lookup - keyed by in-game name only (the part before "#"), lowercase.
 // Add more entries here the same way if other regulars want the same
 // treatment.
+
+// Shuffle-bag picker: hands out entries in random order without repeating
+// one until every other entry in the list has been shown, and avoids an
+// immediate repeat across reshuffles too.
+function makeShuffleBag(items) {
+  let bag = [];
+  let lastPicked = null;
+
+  function refill() {
+    bag = [...items];
+    // Fisher-Yates shuffle
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+    // Avoid the new bag starting with the same line that just ended the last one
+    if (bag.length > 1 && bag[0] === lastPicked) {
+      [bag[0], bag[1]] = [bag[1], bag[0]];
+    }
+  }
+
+  return function pick() {
+    if (bag.length === 0) refill();
+    const next = bag.pop();
+    lastPicked = next;
+    return next;
+  };
+}
+
+const stormmehulRoasts = [
+  "stormmehul has no rank because Diamond doesn't exist in Bronze lobbies.",
+  "stormmehul's last ranked win was a rumor, never confirmed.",
+  "checked the leaderboard twice, still no stormmehul - some legends are unranked by choice (and skill).",
+  "stormmehul is rank #never [Bronze -1] with -9999 RS (still queuing).",
+  "stormmehul isn't on the leaderboard because the servers have mercy.",
+];
+const pickStormmehulRoast = makeShuffleBag(stormmehulRoasts);
+
 const NAME_OVERRIDES = {
-  stormmehul: () => {
-    const roasts = [
-      "stormmehul has no rank because Diamond doesn't exist in Bronze lobbies.",
-      "stormmehul's last ranked win was a rumor, never confirmed.",
-      "checked the leaderboard twice, still no stormmehul - some legends are unranked by choice (and skill).",
-      "stormmehul is rank #never [Iron -1] with -9999 RS (still queuing).",
-      "stormmehul isn't on the leaderboard because the servers have mercy.",
-      "stormmehul is rank ass 1.",
-    ];
-    return roasts[Math.floor(Math.random() * roasts.length)];
-  },
+  stormmehul: pickStormmehulRoast,
 };
 
 // ---------- LOOKUP LOGIC ----------
@@ -300,7 +328,7 @@ app.get('/rs', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v9-stormmehul-easter-egg';
+const SERVER_VERSION = 'v10-stormmehul-shufflebag';
 
 app.get('/debug', (req, res) => {
   res.json({
