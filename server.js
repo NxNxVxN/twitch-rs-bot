@@ -235,6 +235,30 @@ async function lookupByRank(rankNum) {
   return entries.find(e => e.rank === rankNum) || null;
 }
 
+// ---------- LOOKUP LOGIC (RS gap between two ranks) ----------
+// Fetches the full leaderboard once and pulls out both requested ranks,
+// rather than calling lookupByRank twice (which would fetch the whole
+// leaderboard twice for no reason).
+async function lookupRankGap(rankA, rankB) {
+  const season = await getCurrentSeason();
+  const url = `${API_BASE}/${season}/${PLATFORM}`;
+  console.log(`Fetching (rank gap lookup): ${url}`);
+
+  const data = await withRetry(async () => {
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`API responded with ${res.status} for season ${season}: ${body.slice(0, 200)}`);
+    }
+    return res.json();
+  });
+
+  const entries = data && data.data ? data.data : [];
+  const entryA = entries.find(e => e.rank === rankA) || null;
+  const entryB = entries.find(e => e.rank === rankB) || null;
+  return { entryA, entryB };
+}
+
 function formatStatsMessage(entry) {
   const name = entry.name ?? 'unknown';
   const rank = entry.rank ?? '?';
@@ -541,11 +565,60 @@ app.get('/rsup', async (req, res) => {
   }
 });
 
+// ---------- ROUTE: /rankgap (RS difference between two ranks) ----------
+// GET /rankgap?a=1&b=2   -> RS gap between rank #1 and rank #2
+// Defaults to a=1, b=2 if either is missing/invalid.
+//
+// Chat usage: !rankgap 1 2   or just   !rankgap   (defaults to 1 vs 2)
+app.get('/rankgap', async (req, res) => {
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+
+  let rankA = parseInt((req.query.a || '').toString().trim(), 10);
+  let rankB = parseInt((req.query.b || '').toString().trim(), 10);
+  if (Number.isNaN(rankA) || rankA < 1 || rankA > MAX_RANK) rankA = 1;
+  if (Number.isNaN(rankB) || rankB < 1 || rankB > MAX_RANK) rankB = 2;
+
+  console.log(`/rankgap called - raw query string: "${req.originalUrl}", resolved: rank ${rankA} vs rank ${rankB}`);
+
+  if (rankA === rankB) {
+    return res.send(`rank ${rankA} and rank ${rankB} are the same rank, gap is 0`);
+  }
+
+  try {
+    const { entryA, entryB } = await lookupRankGap(rankA, rankB);
+
+    if (!entryA || !entryB) {
+      const missing = !entryA ? rankA : rankB;
+      return res.send(`nobody found at rank #${missing} right now`);
+    }
+
+    const scoreA = entryA.rankScore ?? entryA.fame ?? entryA.score ?? null;
+    const scoreB = entryB.rankScore ?? entryB.fame ?? entryB.score ?? null;
+
+    if (scoreA === null || scoreB === null) {
+      return res.send('score data unavailable for one of those ranks');
+    }
+
+    const gap = Math.abs(scoreA - scoreB);
+    const ahead = scoreA >= scoreB ? entryA : entryB;
+    const behind = scoreA >= scoreB ? entryB : entryA;
+    const aheadRank = scoreA >= scoreB ? rankA : rankB;
+    const behindRank = scoreA >= scoreB ? rankB : rankA;
+
+    return res.send(
+      `rank ${aheadRank} (${ahead.name}) is ${gap} rs ahead of rank ${behindRank} (${behind.name})`.toLowerCase()
+    );
+  } catch (err) {
+    console.error('rankgap error:', err.message);
+    return res.send('something went wrong calculating that gap, try again in a bit');
+  }
+});
+
 // Debug route - shows current detected season and config status without
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v12-rsup-history';
+const SERVER_VERSION = 'v13-rankgap';
 
 app.get('/debug', (req, res) => {
   res.json({
