@@ -10,6 +10,15 @@ const API_BASE = 'https://api.the-finals-leaderboard.com/v1/leaderboard';
 const SEASON_RECHECK_MS = 6 * 60 * 60 * 1000; // 6 hours
 const KNOWN_BASELINE_SEASON = 7;
 const FETCH_TIMEOUT_MS = 8000;
+const MAX_RANK = 10000; // leaderboard API only covers top 10,000
+
+// History tracking config (for /rsup - "how much RS up in last N hours").
+// In-memory only: resets on restart/redeploy, and pauses while the free
+// tier is spun down from inactivity. See README for details.
+const HISTORY_POLL_INTERVAL_MS = 30 * 60 * 1000; // snapshot every 30 min
+const HISTORY_MAX_AGE_MS = 25 * 60 * 60 * 1000; // keep ~25h of snapshots
+const HISTORY_MAX_HOURS = 24;
+const HISTORY_MIN_HOURS = 1;
 
 // Optional manual override - if set, skips auto-detection entirely and
 // always uses this season id. Use this if auto-detection ever picks the
@@ -154,7 +163,6 @@ const stormmehulRoasts = [
   "checked the leaderboard twice, still no stormmehul - some legends are unranked by choice (and skill).",
   "stormmehul is rank #never [Bronze -1] with -9999 RS (still queuing).",
   "stormmehul isn't on the leaderboard because the servers have mercy.",
-  "stormmehul is rank ass 1.",
 ];
 const pickStormmehulRoast = makeShuffleBag(stormmehulRoasts);
 
@@ -162,7 +170,7 @@ const NAME_OVERRIDES = {
   stormmehul: pickStormmehulRoast,
 };
 
-// ---------- LOOKUP LOGIC ----------
+// ---------- LOOKUP LOGIC (by name) ----------
 async function searchLeaderboard(query) {
   const season = await getCurrentSeason();
   const url = `${API_BASE}/${season}/${PLATFORM}?name=${encodeURIComponent(query)}`;
@@ -206,6 +214,27 @@ async function lookupPlayer(query) {
   return { type: 'multiple', matches: entries };
 }
 
+// ---------- LOOKUP LOGIC (by rank number) ----------
+// Fetches the full leaderboard for the current season (no name filter) and
+// finds the entry whose "rank" field matches the requested number.
+async function lookupByRank(rankNum) {
+  const season = await getCurrentSeason();
+  const url = `${API_BASE}/${season}/${PLATFORM}`;
+  console.log(`Fetching (rank lookup): ${url}`);
+
+  const data = await withRetry(async () => {
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`API responded with ${res.status} for season ${season}: ${body.slice(0, 200)}`);
+    }
+    return res.json();
+  });
+
+  const entries = data && data.data ? data.data : [];
+  return entries.find(e => e.rank === rankNum) || null;
+}
+
 function formatStatsMessage(entry) {
   const name = entry.name ?? 'unknown';
   const rank = entry.rank ?? '?';
@@ -223,7 +252,77 @@ function formatStatsMessage(entry) {
   return parts.join(' ').toLowerCase();
 }
 
-// ---------- ROUTE ----------
+// ---------- HISTORY TRACKING (for /rsup) ----------
+// In-memory only. Polls the full leaderboard periodically and keeps a
+// rolling window of snapshots so we can diff a player's RS against
+// "N hours ago". Resets on restart/redeploy and pauses while the free
+// tier is spun down from inactivity - see README.
+let leaderboardHistory = []; // [{ timestamp, players: Map<lowercaseName, {name, rank, score}> }]
+
+async function pollFullLeaderboardSnapshot() {
+  try {
+    const season = await getCurrentSeason();
+    const url = `${API_BASE}/${season}/${PLATFORM}`;
+    console.log(`Fetching (history snapshot): ${url}`);
+
+    const data = await withRetry(async () => {
+      const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'finals-rs-api/1.0' } });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`API responded with ${res.status} for season ${season}: ${body.slice(0, 200)}`);
+      }
+      return res.json();
+    });
+
+    const entries = data && data.data ? data.data : [];
+    const players = new Map();
+    for (const e of entries) {
+      if (!e.name) continue;
+      players.set(e.name.toLowerCase(), {
+        name: e.name,
+        rank: e.rank,
+        score: e.rankScore ?? e.fame ?? e.score ?? null,
+      });
+    }
+
+    leaderboardHistory.push({ timestamp: Date.now(), players });
+    pruneHistory();
+    console.log(`History snapshot taken: ${players.size} players tracked, ${leaderboardHistory.length} snapshots in memory`);
+  } catch (err) {
+    console.error('History snapshot failed:', err.message);
+  }
+}
+
+function pruneHistory() {
+  const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+  while (leaderboardHistory.length && leaderboardHistory[0].timestamp < cutoff) {
+    leaderboardHistory.shift();
+  }
+}
+
+// Finds the snapshot whose timestamp is closest to the target time.
+// Returns null if no snapshots have been taken yet.
+function findClosestSnapshot(targetTimestamp) {
+  if (leaderboardHistory.length === 0) return null;
+  let closest = leaderboardHistory[0];
+  let closestDiff = Math.abs(closest.timestamp - targetTimestamp);
+  for (const snap of leaderboardHistory) {
+    const diff = Math.abs(snap.timestamp - targetTimestamp);
+    if (diff < closestDiff) {
+      closest = snap;
+      closestDiff = diff;
+    }
+  }
+  return closest;
+}
+
+// Kick off the first snapshot at boot, then keep polling on an interval.
+pollFullLeaderboardSnapshot().catch(err => console.error('Initial history snapshot failed:', err));
+setInterval(() => {
+  pollFullLeaderboardSnapshot().catch(err => console.error('Scheduled history snapshot failed:', err));
+}, HISTORY_POLL_INTERVAL_MS);
+
+// ---------- ROUTE: /rs (lookup by name) ----------
 // GET /rs?name=Nats#1234   (or ?name= empty/missing -> streamer's own ID)
 //
 // Two StreamElements command formats are supported, in case one fails to
@@ -325,11 +424,128 @@ app.get('/rs', async (req, res) => {
   }
 });
 
+// ---------- ROUTE: /rank (lookup by rank number) ----------
+// GET /rank?n=5   -> replies with whoever currently holds rank #5
+//
+// Chat usage: !rank 5
+app.get('/rank', async (req, res) => {
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+
+  const raw = (req.query.n ?? req.query.rank ?? '').toString().trim();
+  console.log(`/rank called - raw query string: "${req.originalUrl}", resolved rank: "${raw}"`);
+
+  const rankNum = parseInt(raw, 10);
+  if (!raw || Number.isNaN(rankNum) || rankNum < 1 || rankNum > MAX_RANK) {
+    return res.send(`give me a rank number between 1 and ${MAX_RANK}, e.g. !rank 5`);
+  }
+
+  try {
+    const entry = await lookupByRank(rankNum);
+    if (!entry) {
+      return res.send(`nobody found at rank #${rankNum} right now`);
+    }
+    return res.send(formatStatsMessage(entry));
+  } catch (err) {
+    console.error('Rank lookup error:', err.message);
+    return res.send('something went wrong fetching that rank, try again in a bit');
+  }
+});
+
+// ---------- ROUTE: /rsup (RS change over the last N hours) ----------
+// GET /rsup?name=Nats#1234&hours=24
+//
+// Unlike /rs, this route does NOT support the space-separated "name tag"
+// fallback format, since the second word is reserved for the hours
+// argument here. Use a partial name (fuzzy-matched, like /rs) or the full
+// "name#tag" if the "#" survives your StreamElements setup.
+//
+// Chat usage:
+//   !rsup Nats#1234 24   -> RS change for Nats#1234 over ~24h
+//   !rsup Nats 12        -> partial name match, ~12h window
+//   !rsup                -> streamer's own id, default 24h window
+app.get('/rsup', async (req, res) => {
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+
+  let rawName = req.query.name;
+  if (rawName === undefined) {
+    const match = req.originalUrl.match(/name=([^&]*)/);
+    rawName = match ? match[1] : '';
+  }
+  let query = decodeURIComponent((rawName || '').replace(/\+/g, ' ')).trim();
+  let lookingUpSelf = false;
+
+  if (!query) {
+    if (!STREAMER_EMBARK_ID) {
+      return res.send('no default streamer id configured');
+    }
+    query = STREAMER_EMBARK_ID;
+    lookingUpSelf = true;
+  }
+
+  let hours = parseInt((req.query.hours || '').toString().trim(), 10);
+  if (Number.isNaN(hours)) hours = HISTORY_MAX_HOURS;
+  hours = Math.min(Math.max(hours, HISTORY_MIN_HOURS), HISTORY_MAX_HOURS);
+
+  console.log(`/rsup called - raw query string: "${req.originalUrl}", resolved name: "${query}", hours: ${hours}`);
+
+  try {
+    const result = await lookupPlayer(query);
+
+    if (result.type === 'none') {
+      const who = lookingUpSelf ? `streamer id ${query}` : `"${query}"`;
+      return res.send(`couldn't find ${who} on the ranked leaderboard`);
+    }
+
+    if (result.type === 'multiple') {
+      const names = result.matches.slice(0, 3).map(e => e.name).join(', ');
+      return res.send(`multiple matches for "${query}": ${names} - specify more of the tag`);
+    }
+
+    const currentEntry = result.entry;
+    const currentScore = currentEntry.rankScore ?? currentEntry.fame ?? currentEntry.score ?? null;
+    if (currentScore === null) {
+      return res.send(`no score data available for ${currentEntry.name}`);
+    }
+
+    const targetTimestamp = Date.now() - hours * 60 * 60 * 1000;
+    const snapshot = findClosestSnapshot(targetTimestamp);
+
+    if (!snapshot) {
+      return res.send('still building up history for this - check back in a bit');
+    }
+
+    const past = snapshot.players.get(currentEntry.name.toLowerCase());
+    const actualHours = ((Date.now() - snapshot.timestamp) / (60 * 60 * 1000)).toFixed(1);
+
+    if (!past || past.score === null || past.score === undefined) {
+      return res.send(
+        `${currentEntry.name} wasn't tracked ~${actualHours}h ago (unranked or outside top ${MAX_RANK} then) - try again once more history builds up`
+      );
+    }
+
+    const delta = currentScore - past.score;
+    const trend = delta > 0 ? `up ${delta}` : delta < 0 ? `down ${Math.abs(delta)}` : 'unchanged';
+
+    let rankTrend = '';
+    if (typeof past.rank === 'number' && typeof currentEntry.rank === 'number' && past.rank !== currentEntry.rank) {
+      const rankDelta = past.rank - currentEntry.rank; // positive = moved to a better (lower) rank number
+      rankTrend = rankDelta > 0 ? `, rank up ${rankDelta}` : `, rank down ${Math.abs(rankDelta)}`;
+    }
+
+    return res.send(
+      `${currentEntry.name} is ${trend} rs over the last ~${actualHours}h${rankTrend} (now rank ${currentEntry.rank}, ${currentScore} rs)`.toLowerCase()
+    );
+  } catch (err) {
+    console.error('rsup error:', err.message);
+    return res.send('something went wrong calculating that, try again in a bit');
+  }
+});
+
 // Debug route - shows current detected season and config status without
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v10-stormmehul-shufflebag';
+const SERVER_VERSION = 'v12-rsup-history';
 
 app.get('/debug', (req, res) => {
   res.json({
@@ -338,6 +554,9 @@ app.get('/debug', (req, res) => {
     seasonDetectedAt: seasonDetectedAt ? new Date(seasonDetectedAt).toISOString() : null,
     seasonOverrideSet: Boolean(SEASON_OVERRIDE),
     streamerIdSet: Boolean(STREAMER_EMBARK_ID),
+    historySnapshots: leaderboardHistory.length,
+    oldestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[0].timestamp).toISOString() : null,
+    newestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[leaderboardHistory.length - 1].timestamp).toISOString() : null,
   });
 });
 
