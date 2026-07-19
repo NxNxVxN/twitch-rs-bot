@@ -20,6 +20,11 @@ const HISTORY_MAX_AGE_MS = 25 * 60 * 60 * 1000; // keep ~25h of snapshots
 const HISTORY_MAX_HOURS = 24;
 const HISTORY_MIN_HOURS = 1;
 
+// Timezone used to figure out "midnight" for !rsup today. Set this in the
+// hosting platform's env vars if you're not in UTC, e.g. "America/New_York",
+// "Europe/London", "Asia/Kolkata". Defaults to UTC if unset.
+const STREAMER_TIMEZONE = process.env.STREAMER_TIMEZONE || 'UTC';
+
 // Optional manual override - if set, skips auto-detection entirely and
 // always uses this season id. Use this if auto-detection ever picks the
 // wrong season; set SEASON_OVERRIDE in the hosting platform's env vars.
@@ -276,6 +281,31 @@ function formatStatsMessage(entry) {
   return parts.join(' ').toLowerCase();
 }
 
+// Hours elapsed since midnight today, in the given IANA timezone.
+// Used for "!rsup today". Falls back to a tiny non-zero value right at
+// midnight so downstream math (target timestamp lookups) never divides
+// by/uses a literal 0.
+function hoursSinceMidnight(timezone) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(now);
+
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+
+  const h = Number(map.hour) % 24; // formatToParts can return "24" for midnight in some locales
+  const m = Number(map.minute);
+  const s = Number(map.second);
+
+  const elapsed = h + m / 60 + s / 3600;
+  return elapsed > 0 ? elapsed : 0.05; // guard against exactly 0 at midnight
+}
+
 // ---------- HISTORY TRACKING (for /rsup) ----------
 // In-memory only. Polls the full leaderboard periodically and keeps a
 // rolling window of snapshots so we can diff a player's RS against
@@ -475,8 +505,9 @@ app.get('/rank', async (req, res) => {
   }
 });
 
-// ---------- ROUTE: /rsup (RS change over the last N hours) ----------
+// ---------- ROUTE: /rsup (RS change over the last N hours, or "today") ----------
 // GET /rsup?name=Nats#1234&hours=24
+// GET /rsup?name=Nats#1234&hours=today
 //
 // Unlike /rs, this route does NOT support the space-separated "name tag"
 // fallback format, since the second word is reserved for the hours
@@ -486,6 +517,8 @@ app.get('/rank', async (req, res) => {
 // Chat usage:
 //   !rsup Nats#1234 24   -> RS change for Nats#1234 over ~24h
 //   !rsup Nats 12        -> partial name match, ~12h window
+//   !rsup today          -> streamer's own id, since midnight
+//   !rsup Nats today     -> Nats' RS change since midnight
 //   !rsup                -> streamer's own id, default 24h window
 app.get('/rsup', async (req, res) => {
   res.set('Content-Type', 'text/plain; charset=utf-8');
@@ -496,8 +529,17 @@ app.get('/rsup', async (req, res) => {
     rawName = match ? match[1] : '';
   }
   let query = decodeURIComponent((rawName || '').replace(/\+/g, ' ')).trim();
-  let lookingUpSelf = false;
+  let rawHours = (req.query.hours || '').toString().trim();
 
+  // "!rsup today" only sends one word, which lands in the name slot since
+  // there's no second argument. Detect that case and shift "today" into
+  // the hours slot instead, falling back to the streamer's own id.
+  if (!rawHours && query.toLowerCase() === 'today') {
+    rawHours = query;
+    query = '';
+  }
+
+  let lookingUpSelf = false;
   if (!query) {
     if (!STREAMER_EMBARK_ID) {
       return res.send('no default streamer id configured');
@@ -506,11 +548,19 @@ app.get('/rsup', async (req, res) => {
     lookingUpSelf = true;
   }
 
-  let hours = parseInt((req.query.hours || '').toString().trim(), 10);
-  if (Number.isNaN(hours)) hours = HISTORY_MAX_HOURS;
-  hours = Math.min(Math.max(hours, HISTORY_MIN_HOURS), HISTORY_MAX_HOURS);
+  const isToday = rawHours.toLowerCase() === 'today';
+  let hours;
 
-  console.log(`/rsup called - raw query string: "${req.originalUrl}", resolved name: "${query}", hours: ${hours}`);
+  if (isToday) {
+    hours = hoursSinceMidnight(STREAMER_TIMEZONE);
+    hours = Math.min(hours, HISTORY_MAX_HOURS);
+  } else {
+    let parsedHours = parseInt(rawHours, 10);
+    if (Number.isNaN(parsedHours)) parsedHours = HISTORY_MAX_HOURS;
+    hours = Math.min(Math.max(parsedHours, HISTORY_MIN_HOURS), HISTORY_MAX_HOURS);
+  }
+
+  console.log(`/rsup called - raw query string: "${req.originalUrl}", resolved name: "${query}", hours: ${hours}${isToday ? ' (today)' : ''}`);
 
   try {
     const result = await lookupPlayer(query);
@@ -540,10 +590,12 @@ app.get('/rsup', async (req, res) => {
 
     const past = snapshot.players.get(currentEntry.name.toLowerCase());
     const actualHours = ((Date.now() - snapshot.timestamp) / (60 * 60 * 1000)).toFixed(1);
+    const periodText = isToday ? 'today (since midnight)' : `the last ~${actualHours}h`;
 
     if (!past || past.score === null || past.score === undefined) {
+      const whenText = isToday ? 'yet today' : `~${actualHours}h ago`;
       return res.send(
-        `${currentEntry.name} wasn't tracked ~${actualHours}h ago (unranked or outside top ${MAX_RANK} then) - try again once more history builds up`
+        `${currentEntry.name} wasn't tracked ${whenText} (unranked or outside top ${MAX_RANK} then) - try again once more history builds up`
       );
     }
 
@@ -557,7 +609,7 @@ app.get('/rsup', async (req, res) => {
     }
 
     return res.send(
-      `${currentEntry.name} is ${trend} rs over the last ~${actualHours}h${rankTrend} (now rank ${currentEntry.rank}, ${currentScore} rs)`.toLowerCase()
+      `${currentEntry.name} is ${trend} rs ${periodText}${rankTrend} (now rank ${currentEntry.rank}, ${currentScore} rs)`.toLowerCase()
     );
   } catch (err) {
     console.error('rsup error:', err.message);
@@ -618,7 +670,7 @@ app.get('/rankgap', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v13-rankgap';
+const SERVER_VERSION = 'v14-rsup-today';
 
 app.get('/debug', (req, res) => {
   res.json({
@@ -627,6 +679,7 @@ app.get('/debug', (req, res) => {
     seasonDetectedAt: seasonDetectedAt ? new Date(seasonDetectedAt).toISOString() : null,
     seasonOverrideSet: Boolean(SEASON_OVERRIDE),
     streamerIdSet: Boolean(STREAMER_EMBARK_ID),
+    streamerTimezone: STREAMER_TIMEZONE,
     historySnapshots: leaderboardHistory.length,
     oldestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[0].timestamp).toISOString() : null,
     newestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[leaderboardHistory.length - 1].timestamp).toISOString() : null,
