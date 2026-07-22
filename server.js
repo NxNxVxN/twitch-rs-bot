@@ -15,7 +15,7 @@ const MAX_RANK = 10000; // leaderboard API only covers top 10,000
 // History tracking config (for /rsup - "how much RS up in last N hours").
 // In-memory only: resets on restart/redeploy, and pauses while the free
 // tier is spun down from inactivity. See README for details.
-const HISTORY_POLL_INTERVAL_MS = 30 * 60 * 1000; // snapshot every 30 min
+const HISTORY_POLL_INTERVAL_MS = 5 * 60 * 1000; // snapshot every 5 min
 const HISTORY_MAX_AGE_MS = 25 * 60 * 60 * 1000; // keep ~25h of snapshots
 const HISTORY_MAX_HOURS = 24;
 const HISTORY_MIN_HOURS = 1;
@@ -313,6 +313,12 @@ function hoursSinceMidnight(timezone) {
 // tier is spun down from inactivity - see README.
 let leaderboardHistory = []; // [{ timestamp, players: Map<lowercaseName, {name, rank, score}> }]
 
+// Tracks when the next scheduled snapshot poll will fire, so /rsup can
+// honestly tell people how long until the next update - this is the only
+// update timing we actually control (the leaderboard API itself doesn't
+// publish a refresh cadence, so /rs, /rank, /rankgap don't get a countdown).
+let nextSnapshotAt = Date.now() + HISTORY_POLL_INTERVAL_MS;
+
 async function pollFullLeaderboardSnapshot() {
   try {
     const season = await getCurrentSeason();
@@ -344,6 +350,8 @@ async function pollFullLeaderboardSnapshot() {
     console.log(`History snapshot taken: ${players.size} players tracked, ${leaderboardHistory.length} snapshots in memory`);
   } catch (err) {
     console.error('History snapshot failed:', err.message);
+  } finally {
+    nextSnapshotAt = Date.now() + HISTORY_POLL_INTERVAL_MS;
   }
 }
 
@@ -368,6 +376,12 @@ function findClosestSnapshot(targetTimestamp) {
     }
   }
   return closest;
+}
+
+// Minutes until the next scheduled snapshot poll, floored at 0.
+function minutesUntilNextSnapshot() {
+  const ms = nextSnapshotAt - Date.now();
+  return Math.max(0, Math.round(ms / 60000));
 }
 
 // Kick off the first snapshot at boot, then keep polling on an interval.
@@ -514,6 +528,12 @@ app.get('/rank', async (req, res) => {
 // argument here. Use a partial name (fuzzy-matched, like /rs) or the full
 // "name#tag" if the "#" survives your StreamElements setup.
 //
+// Every reply here ends with "(next update in ~Xm)" - this is the actual
+// time until the next history snapshot poll, since that's the only update
+// cadence this server controls (the leaderboard API itself doesn't publish
+// a refresh interval, so this countdown is intentionally NOT added to
+// /rs, /rank, or /rankgap, which query it live and have no known cadence).
+//
 // Chat usage:
 //   !rsup Nats#1234 24   -> RS change for Nats#1234 over ~24h
 //   !rsup Nats 12        -> partial name match, ~12h window
@@ -562,30 +582,32 @@ app.get('/rsup', async (req, res) => {
 
   console.log(`/rsup called - raw query string: "${req.originalUrl}", resolved name: "${query}", hours: ${hours}${isToday ? ' (today)' : ''}`);
 
+  const nextUpdateSuffix = ` (next update in ~${minutesUntilNextSnapshot()}m)`;
+
   try {
     const result = await lookupPlayer(query);
 
     if (result.type === 'none') {
       const who = lookingUpSelf ? `streamer id ${query}` : `"${query}"`;
-      return res.send(`couldn't find ${who} on the ranked leaderboard`);
+      return res.send(`couldn't find ${who} on the ranked leaderboard${nextUpdateSuffix}`);
     }
 
     if (result.type === 'multiple') {
       const names = result.matches.slice(0, 3).map(e => e.name).join(', ');
-      return res.send(`multiple matches for "${query}": ${names} - specify more of the tag`);
+      return res.send(`multiple matches for "${query}": ${names} - specify more of the tag${nextUpdateSuffix}`);
     }
 
     const currentEntry = result.entry;
     const currentScore = currentEntry.rankScore ?? currentEntry.fame ?? currentEntry.score ?? null;
     if (currentScore === null) {
-      return res.send(`no score data available for ${currentEntry.name}`);
+      return res.send(`no score data available for ${currentEntry.name}${nextUpdateSuffix}`);
     }
 
     const targetTimestamp = Date.now() - hours * 60 * 60 * 1000;
     const snapshot = findClosestSnapshot(targetTimestamp);
 
     if (!snapshot) {
-      return res.send('still building up history for this - check back in a bit');
+      return res.send(`still building up history for this - check back in a bit${nextUpdateSuffix}`);
     }
 
     const past = snapshot.players.get(currentEntry.name.toLowerCase());
@@ -595,7 +617,7 @@ app.get('/rsup', async (req, res) => {
     if (!past || past.score === null || past.score === undefined) {
       const whenText = isToday ? 'yet today' : `~${actualHours}h ago`;
       return res.send(
-        `${currentEntry.name} wasn't tracked ${whenText} (unranked or outside top ${MAX_RANK} then) - try again once more history builds up`
+        `${currentEntry.name} wasn't tracked ${whenText} (unranked or outside top ${MAX_RANK} then) - try again once more history builds up${nextUpdateSuffix}`
       );
     }
 
@@ -609,11 +631,12 @@ app.get('/rsup', async (req, res) => {
     }
 
     return res.send(
-      `${currentEntry.name} is ${trend} rs ${periodText}${rankTrend} (now rank ${currentEntry.rank}, ${currentScore} rs)`.toLowerCase()
+      (`${currentEntry.name} is ${trend} rs ${periodText}${rankTrend} (now rank ${currentEntry.rank}, ${currentScore} rs)`.toLowerCase()) +
+        nextUpdateSuffix
     );
   } catch (err) {
     console.error('rsup error:', err.message);
-    return res.send('something went wrong calculating that, try again in a bit');
+    return res.send(`something went wrong calculating that, try again in a bit${nextUpdateSuffix}`);
   }
 });
 
@@ -670,7 +693,7 @@ app.get('/rankgap', async (req, res) => {
 // exposing secrets. Useful for sanity-checking the live deployment.
 // VERSION marker: bump this string any time server.js changes, so a quick
 // /debug check confirms whether Render is actually running the latest code.
-const SERVER_VERSION = 'v14-rsup-today';
+const SERVER_VERSION = 'v16-5min-snapshots';
 
 app.get('/debug', (req, res) => {
   res.json({
@@ -683,6 +706,8 @@ app.get('/debug', (req, res) => {
     historySnapshots: leaderboardHistory.length,
     oldestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[0].timestamp).toISOString() : null,
     newestSnapshot: leaderboardHistory.length ? new Date(leaderboardHistory[leaderboardHistory.length - 1].timestamp).toISOString() : null,
+    nextSnapshotAt: new Date(nextSnapshotAt).toISOString(),
+    minutesUntilNextSnapshot: minutesUntilNextSnapshot(),
   });
 });
 
